@@ -19,7 +19,8 @@
     "excel automation",
     "dashboard"
   ],
-  "request_pause_s": 1.0,
+  "fetch_workers": 4,
+  "draft_workers": 2,
   "languages": [
     "en"
   ],
@@ -80,6 +81,30 @@
     "pdf",
     "json"
   ],
+  "off_skills": [
+    "data entry",
+    "data collection",
+    "administrative support",
+    "virtual assistant",
+    "customer service",
+    "customer support",
+    "event planning",
+    "time management",
+    "project management",
+    "field research",
+    "photography",
+    "copywriting",
+    "content writing",
+    "article writing",
+    "translation",
+    "social media marketing",
+    "sales",
+    "telemarketing",
+    "video editing",
+    "graphic design",
+    "logo design"
+  ],
+  "skip_local": true,
   "title_reject": [
     "\\bonly\\b",
     "recruit",
@@ -99,7 +124,8 @@
     "closed testing",
     "testers?\\b",
     "testing team",
-    "(coaching|tutor(ing)?|personal trainer|lessons?)(?!.*\\b(app|platform|software|website|system|bot)\\b)"
+    "(coaching|tutor(ing)?|personal trainer|lessons?)(?!.*\\b(app|platform|software|website|system|bot)\\b)",
+    "^(?!.*\\b(automat\\w*|script|bot|api|tool|software|scrap\\w*|python|macro|vba)\\b).*\\bdata entry\\b"
   ],
   "text_reject": [
     "mod apk",

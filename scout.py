@@ -17,8 +17,10 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -42,15 +44,40 @@ HEADERS = {"User-Agent": "job-scout (personal job alerts)"}
 
 # ---------- fetching ----------
 
-def _get(url):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS), timeout=30) as r:
-        return json.load(r)["result"]["projects"]
+PAGE = 100
+RETRY_CODES = {429, 500, 502, 503, 504}
 
 
-def fetch_active(query, ptype):
-    params = {"limit": 100, "query": query, "sort_field": "submitdate",
-              "project_types[]": ptype, "full_description": "true", "job_details": "true"}
-    return _get(API + "active/?" + urllib.parse.urlencode(params))
+def _get(url, tries=3):
+    """GET a projects API URL, retrying rate limits, server errors and timeouts with backoff."""
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS), timeout=30) as r:
+                return json.load(r)["result"]["projects"]
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRY_CODES or attempt == tries - 1:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == tries - 1:
+                raise
+        time.sleep(3 * 2 ** attempt)
+
+
+def fetch_active(query, since):
+    """All active jobs matching query, fixed and hourly, updated since a Unix time.
+
+    The server-side time filter means each request returns a few fresh jobs instead of
+    100 mostly stale ones. Pages only when a page comes back full.
+    """
+    jobs = []
+    for offset in range(0, 5 * PAGE, PAGE):
+        params = {"limit": PAGE, "offset": offset, "query": query, "sort_field": "submitdate",
+                  "from_time": since, "full_description": "true", "job_details": "true"}
+        page = _get(API + "active/?" + urllib.parse.urlencode(params))
+        jobs += page
+        if len(page) < PAGE:
+            break
+    return jobs
 
 
 def fetch_by_id(pid):
@@ -59,16 +86,19 @@ def fetch_by_id(pid):
     return found[0] if found else None
 
 
-def fetch_all():
+def fetch_all(since):
+    def one(q):
+        try:
+            return fetch_active(q, since)
+        except Exception as e:  # one failed query shouldn't stop the scan
+            print(f"warn: query '{q}' failed: {e}", file=sys.stderr)
+            return []
+
     jobs = {}
-    for q in CFG["queries"]:
-        for ptype in ("fixed", "hourly"):
-            try:
-                for p in fetch_active(q, ptype):
-                    jobs[p["id"]] = p
-            except Exception as e:  # one failed query shouldn't stop the scan
-                print(f"warn: query '{q}' ({ptype}) failed: {e}", file=sys.stderr)
-            time.sleep(CFG["request_pause_s"])
+    with ThreadPoolExecutor(CFG.get("fetch_workers", 4)) as ex:
+        for found in ex.map(one, CFG["queries"]):
+            for p in found:
+                jobs[p["id"]] = p
     return list(jobs.values())
 
 
@@ -78,33 +108,46 @@ def to_usd(p, amount):
     return (amount or 0) * (p["currency"].get("exchange_rate") or 1)
 
 
+TITLE_REJECT = [(pat, re.compile(pat)) for pat in CFG["title_reject"]]
+TEXT_REJECT = [(pat, re.compile(pat)) for pat in CFG["text_reject"]]
+STRONG = set(CFG["strong_skills"])
+WEAK = set(CFG["weak_skills"])
+OFF = set(CFG.get("off_skills", []))
+
+
 def evaluate(p, now):
     """Return (score, info) for a job that passes the filters, or (None, reason)."""
-    title = p["title"].lower()
-    desc = (p.get("description") or "").lower()
     if p.get("status") != "active":
         return None, "not active"
+    if p.get("local") and CFG.get("skip_local", True):
+        return None, "on-site (local) job"
     if p.get("language", "en") not in CFG["languages"]:
         return None, f"language {p.get('language')}"
-    for pat in CFG["title_reject"]:
-        if re.search(pat, title):
-            return None, f"title red flag /{pat}/"
-    for pat in CFG["text_reject"]:
-        if re.search(pat, title + " " + desc):
-            return None, f"red flag /{pat}/"
-
+    # cheap numeric checks before the regexes
     age = (now - p["submitdate"]) / 60
     bids = p["bid_stats"]["bid_count"]
     if age > CFG["max_age_min"]:
         return None, "too old"
     if bids > CFG["max_bids"]:
-        return None, f"{bids} bids"
+        return None, "too many bids"
+
+    title = p["title"].lower()
+    desc = (p.get("description") or "").lower()
+    for pat, rx in TITLE_REJECT:
+        if rx.search(title):
+            return None, f"title red flag /{pat}/"
+    text = title + " " + desc
+    for pat, rx in TEXT_REJECT:
+        if rx.search(text):
+            return None, f"red flag /{pat}/"
 
     skills = {j["name"].lower() for j in p.get("jobs") or []}
-    strong = sorted(skills & set(CFG["strong_skills"]))
-    weak = sorted(skills & set(CFG["weak_skills"]))
+    strong = sorted(skills & STRONG)
+    weak = sorted(skills & WEAK)
     if not strong and len(weak) < 2:
         return None, "skills don't match"
+    if len(skills & OFF) > len(strong) + len(weak):  # e.g. admin work that mentions Google Sheets
+        return None, "mostly non-development skills"
 
     budget = p["budget"]
     lo = to_usd(p, budget.get("minimum"))
@@ -203,11 +246,15 @@ def run_claude(prompt, label):
     return body
 
 
-def build_prompt(job_text, platform):
-    pf = PLATFORMS[platform]
+def require_facts():
     if not FACTS_PATH.exists():
         sys.exit("No my_profile.md yet. Copy profile_facts.example.md to my_profile.md and fill in "
                  "facts you can prove; the drafter may only claim what is in that file.")
+
+
+def build_prompt(job_text, platform):
+    pf = PLATFORMS[platform]
+    require_facts()
     example_path = _path(CFG["example_bid"]) if CFG.get("example_bid") else None
     example = example_path.read_text() if example_path and example_path.exists() else "(none)"
     fills = {
@@ -257,11 +304,19 @@ def notify(title, body):
 
 # ---------- commands ----------
 
+def alert(score, p, info, path):
+    what = "Draft ready" if path else "New match"
+    notify(f"{what} [{score}]: {p['title'][:60]}",
+           f"{info['budget']} · {info['bids']} bids · {info['age_min']} min old\n"
+           f"scout.py open {p['id']}")
+
+
 def scan(args):
+    if args.draft:
+        require_facts()  # fail before any work, not inside a drafting thread
     now = time.time()
-    jobs = fetch_all()
-    con = db()
-    seen = {r[0] for r in con.execute("SELECT id FROM jobs")}
+    # 60 s of slack so a job posted while the previous request ran isn't missed
+    jobs = fetch_all(int(now) - CFG["max_age_min"] * 60 - 60)
     matches, rejected = [], {}
     for p in jobs:
         score, info = evaluate(p, now)
@@ -272,8 +327,15 @@ def scan(args):
             matches.append((score, p, info))
     matches.sort(key=lambda m: -m[0])
 
+    con = db()
+    ids = [p["id"] for _, p, _ in matches]
+    known = dict(con.execute(f"SELECT id, status FROM jobs WHERE id IN ({','.join('?' * len(ids))})", ids)
+                 .fetchall()) if ids else {}
+    seen = set(known)
     new = [m for m in matches if m[1]["id"] not in seen]
-    print(f"{datetime.now():%H:%M} scanned {len(jobs)} jobs: {len(matches)} match, {len(new)} new")
+    # earlier drafting failed (expired login, timeout): try again while the job still matches
+    retry = [m for m in matches if known.get(m[1]["id"]) == "new"] if args.draft else []
+    print(f"{datetime.now():%H:%M} scanned {len(jobs)} fresh jobs: {len(matches)} match, {len(new)} new")
     if args.verbose:
         for reason, n in sorted(rejected.items(), key=lambda r: -r[1])[:12]:
             print(f"   skipped {n:4d}  {reason}")
@@ -283,35 +345,52 @@ def scan(args):
         print(f"{tag}[{score}] {p['title'][:70]}\n      {info['budget']} | {info['bids']} bids | "
               f"{info['age_min']} min old | {', '.join(info['skills'][:5])}\n      {info['url']}")
 
-    for score, p, info in new:
-        con.execute("INSERT INTO jobs (id, found_at, score, title, url, budget, bids_when_found, age_when_found)"
+    stamp = datetime.now().isoformat(timespec="seconds")
+    con.executemany("INSERT INTO jobs (id, found_at, score, title, url, budget, bids_when_found, age_when_found)"
                     " VALUES (?,?,?,?,?,?,?,?)",
-                    (p["id"], datetime.now().isoformat(timespec="seconds"), score, p["title"],
-                     info["url"], info["budget"], info["bids"], info["age_min"]))
-        con.commit()
-        path = None
-        if args.draft:
-            path = draft(p, info, score)
+                    [(p["id"], stamp, score, p["title"], info["url"], info["budget"], info["bids"], info["age_min"])
+                     for score, p, info in new])
+    con.commit()
+
+    if not args.draft:
+        if args.notify:
+            for score, p, info in new:
+                alert(score, p, info, None)
+        con.close()
+        return
+
+    retry_ids = {p["id"] for _, p, _ in retry}
+    if retry:
+        print(f"      retrying {len(retry)} earlier failed draft(s)")
+    # drafts run in parallel (each claude -p call takes ~25 s); DB writes and alerts stay on this thread
+    with ThreadPoolExecutor(CFG.get("draft_workers", 2)) as ex:
+        futures = {ex.submit(draft, p, info, score): (score, p, info) for score, p, info in new + retry}
+        for fut in as_completed(futures):
+            score, p, info = futures[fut]
+            try:
+                path = fut.result()
+            except Exception as e:
+                print(f"warn: drafting {p['id']} failed: {e}", file=sys.stderr)
+                path = None
             if path:
                 con.execute("UPDATE jobs SET status='drafted', draft_path=? WHERE id=?", (str(path), p["id"]))
                 con.commit()
                 print(f"      drafted: {path}")
-        if args.notify:
-            what = "Draft ready" if path else "New match"
-            notify(f"{what} [{score}]: {p['title'][:60]}",
-                   f"{info['budget']} · {info['bids']} bids · {info['age_min']} min old\n"
-                   f"scout.py open {p['id']}")
+            if args.notify and (path or p["id"] not in retry_ids):  # retries alert only on success
+                alert(score, p, info, path)
     con.close()
 
 
 def loop(args):
     print(f"Scanning every {args.every} min. Ctrl+C to stop.")
     while True:
+        started = time.monotonic()
         try:
             scan(args)
         except Exception as e:  # keep the loop alive through network errors
             print(f"warn: scan failed: {e}", file=sys.stderr)
-        time.sleep(args.every * 60)
+        # keep a steady interval: drafting time counts toward the wait
+        time.sleep(max(30, args.every * 60 - (time.monotonic() - started)))
 
 
 def list_jobs(args):
@@ -329,7 +408,11 @@ def open_job(args):
     if not row:
         sys.exit(f"{args.id} is not in the scout database; run a scan first.")
     url, path = row
-    live = fetch_by_id(args.id)
+    try:
+        live = fetch_by_id(args.id)
+    except Exception as e:  # offline: still copy the proposal and open the page
+        print(f"Could not check the live job ({e}).")
+        live = None
     if live:
         print(f"now: {live['status']} / {live.get('sub_status') or '-'}, {live['bid_stats']['bid_count']} bids")
         if live["status"] != "active":
