@@ -34,6 +34,7 @@ NEW [84] Python script to sync Google Sheets with a REST API
 
 - Python 3.9+
 - [Claude Code](https://claude.com/claude-code), signed in (`claude -p` does the drafting)
+- For the desktop app: PySide6 (Fedora: `sudo dnf install python3-pyside6`; elsewhere: `pip install PySide6`). The terminal tool doesn't need it.
 - Linux desktop tools for the extras: `notify-send` (alerts), `wl-copy`/`wl-paste` (Wayland clipboard), `xdg-open`. Without them, scanning and drafting still work; proposals are printed instead of copied.
 
 ## Setup
@@ -60,13 +61,32 @@ Optional: create `config.local.json` to override settings without touching the t
 
 ```bash
 ./scout.py scan -v                    # one pass; -v shows why jobs were skipped
-./scout.py loop --draft --notify      # every 15 min: draft and alert for each new match
+./scout.py loop --draft --notify      # every scan_every_min (default 5): draft and alert for each new match
 ./scout.py list                       # recent matches and their drafts
 ./scout.py open 40814454              # live bid count, copy the proposal, open the job page
 ./scout.py draft 40814454             # draft (or redraft) one job by ID
+./scout.py draft 40814454 --note "shorter, mention my Odoo work"
 ```
 
 Drafts are saved as Markdown in `bids/` (or your `bids_dir`) with these sections: client requirements, suggested bid, risks, proposal, and a checklist to work through before sending.
+
+### Desktop app
+
+```bash
+./scout_gui.py --install     # once: adds Job Scout to your app menu
+./scout_gui.py               # or start it from the menu
+```
+
+A window and tray icon on top of the same database. The scanner keeps running as the background service, so alerts still arrive when the window is closed.
+
+- **Job list** with score, budget, bid count (updated every scan), age, status and tags such as *crowded*, *likely crowded* and *niche*. Tabs for To review, Opened, Submitted and Skipped, a title filter, and an "Only last 24 h" switch.
+- **Job panel**: the draft's requirements, suggested bid, risks and checklist, the live bid count, and the **proposal in an editable box** with a counter that turns red past Freelancer's 1,500 characters. Edits save back into the draft file.
+- **Buttons**: Copy proposal & open job (Ctrl+Return or double-click a row), Copy proposal, Mark submitted, Skip, Redraft with an optional note, Open draft file.
+- **Paste a job** window for Upwork and other sites.
+- **Settings** for scan interval, thresholds, crowding limits and skill lists, saved to `config.local.json`, and an option to start in the tray at login.
+- **Scanner controls**: running state and last scan in the status bar, **Stop scanning / Start scanning**, Scan now and the scanner log. The tray icon shows how many fresh matches are waiting.
+- **Shut down** (toolbar, File menu or tray) stops the scanner and closes the app, optionally keeping the scanner from starting at login. Closing the window or Quit leaves the scanner running.
+- Desktop alerts get a **Show in app** button that opens the window on that job.
 
 ### Paste mode (Upwork and other sites)
 
@@ -96,6 +116,7 @@ The public API doesn't show everything, so check the job page while logged in:
 | `queries` | Search terms sent to the API on each scan (one request each, fixed and hourly together) |
 | `fetch_workers` | Queries sent at the same time (default 4; keep it small to be polite to the API) |
 | `draft_workers` | Drafts written at the same time (default 2) |
+| `scan_every_min` | Minutes between scans for `loop` (default 5) |
 | `max_age_min`, `max_bids` | Freshness limits |
 | `min_fixed_usd`, `min_hourly_usd` | Budget floors, converted to USD |
 | `score_threshold` | Higher means fewer, better alerts |
@@ -118,7 +139,7 @@ Description=Freelance job scout
 
 [Service]
 WorkingDirectory=%h/job-scout
-ExecStart=/usr/bin/python3 -I scout.py loop --every 2 --draft --notify
+ExecStart=/usr/bin/python3 -I scout.py loop --draft --notify
 Restart=on-failure
 Environment=PATH=%h/.local/bin:/usr/bin
 

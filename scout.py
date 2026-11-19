@@ -178,7 +178,7 @@ def evaluate(p, now):
     cur = p["currency"]["code"]
     unit = "/hr" if hourly else ""
     info = {
-        "age_min": round(age), "bids": bids, "skills": strong + weak, "hot": hot,
+        "age_min": round(age), "bids": bids, "skills": strong + weak, "hot": hot, "niche": bool(skills & NICHE),
         "budget": f"{cur} {(budget.get('minimum') or 0):g}-{(budget.get('maximum') or budget.get('minimum') or 0):g}{unit} (~${lo:.0f}-{hi:.0f}{unit})",
         "url": f"https://www.freelancer.com/projects/{p['seo_url']}/details",
     }
@@ -187,15 +187,42 @@ def evaluate(p, now):
 
 # ---------- storage ----------
 
+STATUSES = ("new", "drafted", "opened", "submitted", "skipped")
+
+
 def db():
-    con = sqlite3.connect(DB_PATH)
+    # WAL + a busy timeout let the desktop app read and write while the scanner runs
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY, found_at TEXT, score INTEGER, title TEXT, url TEXT,
         budget TEXT, bids_when_found INTEGER, age_when_found INTEGER,
         status TEXT DEFAULT 'new', draft_path TEXT)""")
-    if "crowd_warned" not in {r[1] for r in con.execute("PRAGMA table_info(jobs)")}:
-        con.execute("ALTER TABLE jobs ADD COLUMN crowd_warned INTEGER DEFAULT 0")
+    cols = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+    for name, kind in (("crowd_warned", "INTEGER DEFAULT 0"), ("tags", "TEXT DEFAULT ''"),
+                       ("bids_now", "INTEGER"), ("bids_checked_at", "TEXT")):
+        if name not in cols:
+            con.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
     return con
+
+
+def set_status(pid, status):
+    con = db()
+    con.execute("UPDATE jobs SET status=? WHERE id=?", (status, pid))
+    con.commit()
+    con.close()
+
+
+def record_bids(con, jobs):
+    """Store the latest bid count of every saved job this scan saw (no extra requests)."""
+    stamp = datetime.now().isoformat(timespec="seconds")
+    con.executemany("UPDATE jobs SET bids_now=?, bids_checked_at=? WHERE id=?",
+                    [(p["bid_stats"]["bid_count"], stamp, p["id"]) for p in jobs])
+    con.commit()
+
+
+def tags_for(info):
+    return ", ".join(t for t, on in (("likely crowded", info.get("hot")), ("niche", info.get("niche"))) if on)
 
 
 # ---------- drafting ----------
@@ -265,7 +292,7 @@ def require_facts():
                  "facts you can prove; the drafter may only claim what is in that file.")
 
 
-def build_prompt(job_text, platform):
+def build_prompt(job_text, platform, note=None):
     pf = PLATFORMS[platform]
     require_facts()
     example_path = _path(CFG["example_bid"]) if CFG.get("example_bid") else None
@@ -278,11 +305,13 @@ def build_prompt(job_text, platform):
     prompt = (HERE / "draft_prompt.md").read_text()
     for key, value in fills.items():
         prompt = prompt.replace(key, value)
+    if note:  # from the developer, so it goes above the untrusted job text
+        prompt = prompt.replace("# JOB\n", f"# NOTE FROM THE DEVELOPER FOR THIS DRAFT\n\n{note.strip()}\n\n# JOB\n", 1)
     return prompt.replace("{job}", job_text)  # last, so text inside the job can't trigger replacements
 
 
-def draft(p, info, score):
-    body = run_claude(build_prompt(job_summary(p, info), "freelancer"), p["id"])
+def draft(p, info, score, note=None):
+    body = run_claude(build_prompt(job_summary(p, info), "freelancer", note), p["id"])
     if not body:
         return None
 
@@ -306,10 +335,21 @@ def draft(p, info, score):
     return path
 
 
+_PROPOSAL = re.compile(r"(^## Proposal\s*\n)(.*?)(?=^## |\Z)", re.S | re.M)
+
+
 def proposal_text(path):
-    text = Path(path).read_text()
-    m = re.search(r"^## Proposal\s*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
-    return m.group(1).strip() if m else None
+    m = _PROPOSAL.search(Path(path).read_text())
+    return m.group(2).strip() if m else None
+
+
+def save_proposal(path, proposal):
+    """Write an edited proposal back into its draft file (the first ## Proposal section)."""
+    path = Path(path)
+    text = path.read_text()
+    if not _PROPOSAL.search(text):
+        raise ValueError(f"{path.name} has no ## Proposal section")
+    path.write_text(_PROPOSAL.sub(lambda m: m.group(1) + "\n" + proposal.strip() + "\n\n", text, count=1))
 
 
 # ---------- alerts ----------
@@ -318,7 +358,8 @@ NOTIFY_IDS = {}  # project id -> desktop notification id, so a later alert repla
 
 # Runs the notification and, if its button is clicked, `scout.py open <id>`. It is detached so the
 # button keeps working after the scan ends. Arguments arrive as "$@"; nothing is spliced into the script.
-_BUTTON_SCRIPT = 'a=$("$@"); case "$a" in open|default) exec "$PY" -I "$SCOUT" open "$ID" >/dev/null 2>&1;; esac'
+_BUTTON_SCRIPT = ('a=$("$@"); case "$a" in open|default) exec "$PY" -I "$SCOUT" open "$ID" >/dev/null 2>&1;; '
+                  'show) exec "$PY" -I "$GUI" --job "$ID" >/dev/null 2>&1;; esac')
 
 
 def close_notification(nid):
@@ -349,8 +390,12 @@ def notify(title, body, replace=None, open_id=None):
         # sender. So close the earlier alert and post a fresh one from the process that waits.
         if replace:
             close_notification(replace)
-        cmd += ["-A", "default=Open", "-A", "open=Open job & copy proposal", title, body]
-        env = {**os.environ, "PY": sys.executable, "SCOUT": str(HERE / "scout.py"), "ID": str(open_id)}
+        cmd += ["-A", "default=Open", "-A", "open=Open job & copy proposal"]
+        if (HERE / "scout_gui.py").exists():
+            cmd += ["-A", "show=Show in app"]
+        cmd += [title, body]
+        env = {**os.environ, "PY": sys.executable, "SCOUT": str(HERE / "scout.py"),
+               "GUI": str(HERE / "scout_gui.py"), "ID": str(open_id)}
         subprocess.Popen(["sh", "-c", _BUTTON_SCRIPT, "sh", *cmd], env=env, cwd=HERE, start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -455,12 +500,13 @@ def scan(args):
               f"{info['age_min']} min old | {', '.join(info['skills'][:5])}\n      {info['url']}")
 
     stamp = datetime.now().isoformat(timespec="seconds")
-    con.executemany("INSERT INTO jobs (id, found_at, score, title, url, budget, bids_when_found, age_when_found)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    [(p["id"], stamp, score, p["title"], info["url"], info["budget"], info["bids"], info["age_min"])
-                     for score, p, info in new])
+    con.executemany("INSERT OR IGNORE INTO jobs (id, found_at, score, title, url, budget, bids_when_found, age_when_found, tags)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    [(p["id"], stamp, score, p["title"], info["url"], info["budget"], info["bids"], info["age_min"],
+                      tags_for(info)) for score, p, info in new])
     con.commit()
 
+    record_bids(con, jobs)
     check_crowding(con, jobs, args.notify)
     if args.notify:  # alert now; the draft follows in about 30 s
         for score, p, info in new:
@@ -539,14 +585,15 @@ def open_job(args):
     else:
         print("No draft for this job yet; run: scout.py draft", args.id)
     subprocess.run(["xdg-open", url], check=False)
-    con.execute("UPDATE jobs SET status='opened' WHERE id=?", (args.id,))
+    con.execute("UPDATE jobs SET status='opened' WHERE id=? AND status IN ('new', 'drafted')", (args.id,))
     con.commit()
 
 
-def draft_one(args):
-    p = fetch_by_id(args.id)
+def redraft(pid, note=None):
+    """Draft (or redraft) one Freelancer job by ID and save it. Returns the draft path; raises RuntimeError."""
+    p = fetch_by_id(pid)
     if not p:
-        sys.exit(f"Project {args.id} not found.")
+        raise RuntimeError(f"Project {pid} not found.")
     score, info = evaluate(p, time.time())
     if score is None:
         print(f"Note: this job fails the filters ({info}); drafting anyway.")
@@ -557,16 +604,26 @@ def draft_one(args):
                 "budget": f"{p['currency']['code']} {b.get('minimum')}-{b.get('maximum')}"
                           + ("/hr" if p["type"] == "hourly" else ""),
                 "url": f"https://www.freelancer.com/projects/{p['seo_url']}/details"}
-    path = draft(p, info, score)
+    path = draft(p, info, score, note)
     if not path:
-        sys.exit("Drafting failed.")
+        raise RuntimeError("Drafting failed (is Claude Code signed in?).")
+    stamp = datetime.now().isoformat(timespec="seconds")
     con = db()
-    con.execute("INSERT OR IGNORE INTO jobs (id, found_at, score, title, url, budget, bids_when_found, age_when_found)"
-                " VALUES (?,?,?,?,?,?,?,?)", (p["id"], datetime.now().isoformat(timespec="seconds"), score,
-                                              p["title"], info["url"], info["budget"], info["bids"], info["age_min"]))
-    con.execute("UPDATE jobs SET status='drafted', draft_path=? WHERE id=?", (str(path), p["id"]))
+    con.execute("INSERT OR IGNORE INTO jobs (id, found_at, score, title, url, budget, bids_when_found, age_when_found,"
+                " tags) VALUES (?,?,?,?,?,?,?,?,?)", (p["id"], stamp, score, p["title"], info["url"], info["budget"],
+                                                      info["bids"], info["age_min"], tags_for(info)))
+    con.execute("UPDATE jobs SET status='drafted', draft_path=?, bids_now=?, bids_checked_at=? WHERE id=?",
+                (str(path), p["bid_stats"]["bid_count"], stamp, p["id"]))
     con.commit()
-    print(f"Drafted: {path}")
+    con.close()
+    return path
+
+
+def draft_one(args):
+    try:
+        print(f"Drafted: {redraft(args.id, args.note)}")
+    except RuntimeError as e:
+        sys.exit(str(e))
 
 
 SKIP_TITLE = re.compile(r"^(posted|save job|flag as|worldwide|job details|apply now|\d+ (minutes?|hours?|days?) ago)", re.I)
@@ -589,38 +646,54 @@ def read_paste(args):
         sys.exit("Could not read the clipboard. Pipe the text in or use --file.")
 
 
-def paste(args):
-    """Draft a bid from job text copied out of Upwork (or anywhere else)."""
-    text = read_paste(args).strip()
-    if len(text) < 200:
-        sys.exit(f"Only {len(text)} characters pasted. Copy the whole job post (title, description, "
-                 "budget, client info and any questions), then run this again.")
-    limit = 20000
-    if len(text) > limit:
-        print(f"Note: job text is {len(text)} characters; using the first {limit}.")
-        text = text[:limit]
+PASTE_MIN, PASTE_MAX = 200, 20000
 
-    title = args.title or next((ln.strip() for ln in text.splitlines()
-                                if ln.strip() and not SKIP_TITLE.match(ln.strip())), "Pasted job")[:120]
-    print(f"Drafting a bid for: {title} ({PLATFORMS[args.platform]['name']}, about 30 seconds)")
-    body = run_claude(build_prompt(text, args.platform), title)
+
+def paste_title(text):
+    return next((ln.strip() for ln in text.splitlines()
+                 if ln.strip() and not SKIP_TITLE.match(ln.strip())), "Pasted job")[:120]
+
+
+def draft_pasted(text, platform, url=None, title=None, note=None):
+    """Draft a bid from pasted job text and save it. Returns (path, body); raises ValueError or RuntimeError."""
+    text = text.strip()
+    if len(text) < PASTE_MIN:
+        raise ValueError(f"Only {len(text)} characters pasted. Copy the whole job post (title, description, "
+                         "budget, client info and any questions).")
+    text = text[:PASTE_MAX]
+    title = title or paste_title(text)
+    body = run_claude(build_prompt(text, platform, note), title)
     if not body:
-        sys.exit("Drafting failed.")
+        raise RuntimeError("Drafting failed (is Claude Code signed in?).")
 
-    path = BIDS_DIR / f"{args.platform}-{slugify(title)}.md"
+    path = BIDS_DIR / f"{platform}-{slugify(title)}.md"
     n = 2
     while path.exists():
-        path = BIDS_DIR / f"{args.platform}-{slugify(title)}-{n}.md"
+        path = BIDS_DIR / f"{platform}-{slugify(title)}-{n}.md"
         n += 1
     header = "\n".join([
         f"# {title}", "",
-        f"- Job: {args.url or '(pasted text; add the link here)'}",
-        f"- Platform: {PLATFORMS[args.platform]['name']}",
+        f"- Job: {url or '(pasted text; add the link here)'}",
+        f"- Platform: {PLATFORMS[platform]['name']}",
         f"- Drafted: {datetime.now():%Y-%m-%d %H:%M} from pasted text",
         "- Status: draft by job-scout paste mode, not sent. Review every line before submitting.", "",
     ])
     original = "\n\n## Original job text\n\n````text\n" + text.replace("````", "```") + "\n````\n"
     path.write_text(header + "\n" + body + "\n" + original)
+    return path, body
+
+
+def paste(args):
+    """Draft a bid from job text copied out of Upwork (or anywhere else)."""
+    text = read_paste(args).strip()
+    if len(text) > PASTE_MAX:
+        print(f"Note: job text is {len(text)} characters; using the first {PASTE_MAX}.")
+    title = args.title or paste_title(text)
+    print(f"Drafting a bid for: {title} ({PLATFORMS[args.platform]['name']}, about 30 seconds)")
+    try:
+        path, body = draft_pasted(text, args.platform, args.url, title)
+    except (ValueError, RuntimeError) as e:
+        sys.exit(str(e))
 
     for name in ("Suggested bid", "Risks", "Screening answers"):
         part = section(body, name)
@@ -646,12 +719,15 @@ def main():
         sp.add_argument("--notify", action="store_true", help="desktop alert for each new match")
         sp.add_argument("-v", "--verbose", action="store_true", help="show why jobs were skipped")
         if name == "loop":
-            sp.add_argument("--every", type=int, default=15, help="minutes between scans")
+            sp.add_argument("--every", type=int, default=CFG.get("scan_every_min", 15),
+                            help="minutes between scans (default: scan_every_min in the config)")
     sp = sub.add_parser("list")
     sp.add_argument("--all", action="store_true")
     for name in ("open", "draft"):
         sp = sub.add_parser(name)
         sp.add_argument("id", type=int)
+        if name == "draft":
+            sp.add_argument("--note", help='extra instruction for this draft, e.g. "shorter, mention Odoo"')
     sp = sub.add_parser("paste", help="draft from job text on the clipboard, a file, or stdin")
     sp.add_argument("--platform", choices=sorted(PLATFORMS), default="upwork")
     sp.add_argument("--file", help="read the job text from this file instead of the clipboard")

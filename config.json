@@ -24,6 +24,7 @@
   "languages": [
     "en"
   ],
+  "scan_every_min": 5,
   "max_age_min": 180,
   "max_bids": 25,
   "min_fixed_usd": 20,
