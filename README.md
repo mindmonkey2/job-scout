@@ -19,9 +19,10 @@ NEW [84] Python script to sync Google Sheets with a REST API
 
 ## Benefits
 
-- **Be early without refreshing all day.** It scans every 15 minutes (or as often as you like) and sends a desktop alert only for jobs worth your time.
+- **Be early without refreshing all day.** It scans every few minutes and alerts you the moment a job matches; the draft arrives about 30 seconds later in the same notification, with the live bid count. Click it to copy the proposal and open the job page.
+- **Know when a job is swarmed.** Popular jobs can collect 100+ bids in minutes. Job Scout keeps watching what it alerted you about and sends "Crowded, probably skip" when a job fills up fast, so you spend your time where a proposal will be read.
 - **Skip the junk automatically.** Built-in filters drop scams, "account rental" requests, crypto token spam, gambling, fake reviews, country-locked posts and non-development jobs.
-- **Ranked by real winnability.** Each job gets a score out of 100: freshness (30), few bids so far (30), skill match (24), budget fit (12) and a clear description (4).
+- **Ranked by real winnability.** Each job gets a score out of 100: freshness (30), few bids so far (30), skill match (24), budget fit (12) and a clear description (4). Jobs likely to be swarmed (big budget plus several trending AI tags) lose a few points; jobs needing a specific stack gain a few.
 - **Specific proposals, not templates.** Every draft restates the client's actual problem, gives a concrete plan, says how the work will be tested, and asks two useful questions. It also suggests a bid amount and lists the risks.
 - **No invented experience.** The drafter may only claim facts you list in `my_profile.md`. Anything unproven appears as a `[placeholder]` for you to confirm or delete, so you never send a claim you can't back up.
 - **Safe with untrusted job text.** Job posts can contain prompt injections aimed at AI tools. Drafting runs `claude -p` with **all tools and MCP servers disabled**, and the prompt tells the model to flag such instructions instead of following them.
@@ -101,6 +102,9 @@ The public API doesn't show everything, so check the job page while logged in:
 | `strong_skills` / `weak_skills` | A job needs one strong skill or two weak ones |
 | `off_skills` | Non-development skills; a job with more of these than matching skills is skipped |
 | `skip_local` | Skip on-site jobs that need you in a particular city (default `true`) |
+| `crowd_bids`, `crowd_rate_per_min` | When to send "Crowded, probably skip": at this many bids, or when bids arrive this fast after the alert (defaults 30 and 4/min) |
+| `hot_skills`, `hot_budget_usd`, `hot_penalty` | Jobs with 3+ of these tags and a budget at or above this lose `hot_penalty` points and are marked "likely crowded" |
+| `niche_skills`, `niche_bonus` | Jobs needing any of these specific skills gain `niche_bonus` points |
 | `title_reject` / `text_reject` | Regexes for spam and off-topic jobs |
 | `claude_model` | Model for drafting (`null` uses your Claude Code default) |
 
@@ -114,7 +118,7 @@ Description=Freelance job scout
 
 [Service]
 WorkingDirectory=%h/job-scout
-ExecStart=/usr/bin/python3 -I scout.py loop --every 15 --draft --notify
+ExecStart=/usr/bin/python3 -I scout.py loop --every 2 --draft --notify
 Restart=on-failure
 Environment=PATH=%h/.local/bin:/usr/bin
 
@@ -135,7 +139,8 @@ Each draft is one `claude -p` call (about 25 seconds) and counts toward your Cla
 2. **Filter:** drops jobs that are too old, have too many bids, use the wrong language, match a red-flag pattern, pay too little, or don't match your skills.
 3. **Score:** ranks the rest, and anything above `score_threshold` counts as a match.
 4. **Draft:** builds a prompt from `draft_prompt.md`, your verified facts and the job, then runs `claude -p` with no tools, two jobs at a time. If a draft fails, the next scan tries again while the job still matches.
-5. **Alert:** stores the match in `scout.db`, writes the draft, and sends a desktop notification.
+5. **Alert:** stores the match in `scout.db` and alerts you at once. When the draft is written, the same notification is replaced with the live bid count and an "Open & copy" button.
+6. **Watch:** on later scans, earlier matches that are filling fast get a "Crowded, probably skip" alert. This uses data the scan already fetched, so it costs no extra requests.
 
 ## License
 

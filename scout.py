@@ -12,6 +12,7 @@ It never submits a bid or messages a client. You review each draft and submit it
 """
 import argparse
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -21,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +46,7 @@ HEADERS = {"User-Agent": "job-scout (personal job alerts)"}
 # ---------- fetching ----------
 
 PAGE = 100
+FREELANCER_LIMIT = 1500  # characters the Freelancer bid box accepts
 RETRY_CODES = {429, 500, 502, 503, 504}
 
 
@@ -113,6 +115,8 @@ TEXT_REJECT = [(pat, re.compile(pat)) for pat in CFG["text_reject"]]
 STRONG = set(CFG["strong_skills"])
 WEAK = set(CFG["weak_skills"])
 OFF = set(CFG.get("off_skills", []))
+HOT = set(CFG.get("hot_skills", []))
+NICHE = set(CFG.get("niche_skills", []))
 
 
 def evaluate(p, now):
@@ -163,11 +167,18 @@ def evaluate(p, now):
     score += min(24, 8 * len(strong) + 3 * len(weak))
     score += 10 if hourly else (12 if 50 <= hi <= 1000 else 6)
     score += 4 if len(desc) >= 400 else 0
+    # big budget + several trending AI tags: these get 100+ bids in minutes, so rank them lower;
+    # a specific stack draws fewer bidders, so rank it higher
+    hot = len(skills & HOT) >= 3 and hi >= CFG.get("hot_budget_usd", 500)
+    if hot:
+        score -= CFG.get("hot_penalty", 12)
+    if skills & NICHE:
+        score += CFG.get("niche_bonus", 6)
 
     cur = p["currency"]["code"]
     unit = "/hr" if hourly else ""
     info = {
-        "age_min": round(age), "bids": bids, "skills": strong + weak,
+        "age_min": round(age), "bids": bids, "skills": strong + weak, "hot": hot,
         "budget": f"{cur} {(budget.get('minimum') or 0):g}-{(budget.get('maximum') or budget.get('minimum') or 0):g}{unit} (~${lo:.0f}-{hi:.0f}{unit})",
         "url": f"https://www.freelancer.com/projects/{p['seo_url']}/details",
     }
@@ -182,6 +193,8 @@ def db():
         id INTEGER PRIMARY KEY, found_at TEXT, score INTEGER, title TEXT, url TEXT,
         budget TEXT, bids_when_found INTEGER, age_when_found INTEGER,
         status TEXT DEFAULT 'new', draft_path TEXT)""")
+    if "crowd_warned" not in {r[1] for r in con.execute("PRAGMA table_info(jobs)")}:
+        con.execute("ALTER TABLE jobs ADD COLUMN crowd_warned INTEGER DEFAULT 0")
     return con
 
 
@@ -204,7 +217,7 @@ PLATFORMS = {
     "freelancer": {
         "name": "Freelancer.com",
         "notes": "- Freelancer charges about 10% or a $5 minimum on fixed jobs; mention when the fee eats a big share.\n"
-                 "- The proposal box shows the whole text, but clients skim: the first line must carry the pitch.",
+                 "- The bid box accepts at most 1,500 characters, and clients skim: the first line must carry the pitch.",
         "bid_extra": "",
         "extra_sections": "",
         "check": 'Open the page: payment verified? client account age and history? any "$20 balance" or language lock?',
@@ -279,8 +292,15 @@ def draft(p, info, score):
         f"- Pay: {info['budget']}, {p['type']}",
         f"- Found: {datetime.now():%Y-%m-%d %H:%M}, {info['age_min']} min after posting, {info['bids']} bids",
         f"- Scout score: {score}",
-        "- Status: draft by job-scout, not sent. Review every line before submitting.", "",
+        "- Status: draft by job-scout, not sent. Review every line before submitting.",
     ])
+    proposal = section(body, "Proposal") or ""
+    if len(proposal) > FREELANCER_LIMIT:
+        warning = (f"Proposal is {len(proposal)} characters; Freelancer accepts at most "
+                   f"{FREELANCER_LIMIT}. Shorten it before submitting.")
+        print(f"warn: {p['id']}: {warning}", file=sys.stderr)
+        header += f"\n- **Too long:** {warning}"
+    header += "\n"
     path = BIDS_DIR / f"scout-{p['id']}-{slugify(p['title'])}.md"
     path.write_text(header + "\n" + body + "\n")
     return path
@@ -294,21 +314,110 @@ def proposal_text(path):
 
 # ---------- alerts ----------
 
-def notify(title, body):
+NOTIFY_IDS = {}  # project id -> desktop notification id, so a later alert replaces the earlier one
+
+# Runs the notification and, if its button is clicked, `scout.py open <id>`. It is detached so the
+# button keeps working after the scan ends. Arguments arrive as "$@"; nothing is spliced into the script.
+_BUTTON_SCRIPT = 'a=$("$@"); case "$a" in open|default) exec "$PY" -I "$SCOUT" open "$ID" >/dev/null 2>&1;; esac'
+
+
+def close_notification(nid):
     try:
-        subprocess.run(["notify-send", "-a", "Job Scout", "-u", "critical", title, body],
-                       timeout=10, check=False)
-    except OSError:
+        subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                        "--object-path", "/org/freedesktop/Notifications",
+                        "--method", "org.freedesktop.Notifications.CloseNotification", str(int(nid))],
+                       capture_output=True, timeout=10)
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
+
+
+def notify(title, body, replace=None, open_id=None):
+    """Desktop alert. Returns its id so a later alert can replace it (None with a button).
+
+    With open_id, the alert gets an "Open & copy" button (clicking the alert body works too)
+    that copies the proposal and opens the job page.
+    """
+    cmd = ["notify-send", "-a", "Job Scout", "-u", "critical"]
+    try:
+        if open_id is None:
+            if replace:
+                cmd += ["-r", str(replace)]
+            out = subprocess.run(cmd + ["-p", title, body], capture_output=True, text=True, timeout=10).stdout
+            return int(out.split()[0]) if out.strip() else None
+        # A button only works on a brand-new notification: KDE Plasma sends the click to the process
+        # that first created a notification, and replacing one (-r) keeps the original, long-gone
+        # sender. So close the earlier alert and post a fresh one from the process that waits.
+        if replace:
+            close_notification(replace)
+        cmd += ["-A", "default=Open", "-A", "open=Open job & copy proposal", title, body]
+        env = {**os.environ, "PY": sys.executable, "SCOUT": str(HERE / "scout.py"), "ID": str(open_id)}
+        subprocess.Popen(["sh", "-c", _BUTTON_SCRIPT, "sh", *cmd], env=env, cwd=HERE, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def crowding(bids_then, bids_now, minutes):
+    """Why a job is filling too fast to be worth a bid, or None."""
+    added = bids_now - bids_then
+    if bids_now >= CFG.get("crowd_bids", 30):
+        return f"{bids_now} bids"
+    if added >= 10 and added / max(minutes, 1) >= CFG.get("crowd_rate_per_min", 4):
+        return f"+{added} bids in {max(minutes, 1):.0f} min"
+    return None
 
 
 # ---------- commands ----------
 
-def alert(score, p, info, path):
-    what = "Draft ready" if path else "New match"
-    notify(f"{what} [{score}]: {p['title'][:60]}",
-           f"{info['budget']} · {info['bids']} bids · {info['age_min']} min old\n"
-           f"scout.py open {p['id']}")
+def summary_line(info, bids=None):
+    hot = " · likely crowded" if info.get("hot") else ""
+    return f"{info['budget']} · {info['bids'] if bids is None else bids} bids · {info['age_min']} min old{hot}"
+
+
+def alert_found(score, p, info, drafting):
+    """First alert, sent the moment a job matches; with drafting on, it is replaced when the draft is ready."""
+    title = f"New match [{score}]: {p['title'][:60]}"
+    if drafting:
+        NOTIFY_IDS[p["id"]] = notify(title, summary_line(info) + "\nDrafting a proposal…")
+    else:
+        notify(title, summary_line(info) + "\nClick to open the job", open_id=p["id"])
+
+
+def alert_ready(score, p, info, path):
+    """Replace the first alert with the draft, after a live bid check. Returns a crowding reason or None."""
+    try:
+        live = fetch_by_id(p["id"])
+    except Exception:
+        live = None
+    bids = live["bid_stats"]["bid_count"] if live else info["bids"]
+    reason = crowding(info["bids"], bids, 1) if live else None
+    what = f"Draft ready, but crowded ({reason})" if reason else ("Draft ready" if path else "Drafting failed")
+    action = "Click to copy the proposal and open the job" if path else "Click to open the job"
+    notify(f"{what} [{score}]: {p['title'][:60]}", f"{summary_line(info, bids)} now\n{action}",
+           replace=NOTIFY_IDS.pop(p["id"], None), open_id=p["id"])
+    return reason
+
+
+def check_crowding(con, jobs, notify_on):
+    """Warn about earlier matches that have filled up since their alert. Uses this scan's data, no extra requests."""
+    by_id = {p["id"]: p for p in jobs}
+    cutoff = (datetime.now() - timedelta(minutes=CFG["max_age_min"])).isoformat(timespec="seconds")
+    rows = con.execute("SELECT id, title, found_at, bids_when_found FROM jobs WHERE crowd_warned=0"
+                       " AND status IN ('new', 'drafted') AND found_at >= ?", (cutoff,)).fetchall()
+    for pid, title, found_at, bids_then in rows:
+        if pid not in by_id:
+            continue
+        minutes = (datetime.now() - datetime.fromisoformat(found_at)).total_seconds() / 60
+        reason = crowding(bids_then, by_id[pid]["bid_stats"]["bid_count"], minutes)
+        if not reason:
+            continue
+        print(f"      crowded: {pid} {title[:50]} ({reason})")
+        if notify_on:
+            notify(f"Crowded, probably skip: {title[:60]}", f"{reason} since the alert {minutes:.0f} min ago",
+                   replace=NOTIFY_IDS.pop(pid, None))
+        con.execute("UPDATE jobs SET crowd_warned=1 WHERE id=?", (pid,))
+    con.commit()
 
 
 def scan(args):
@@ -352,10 +461,11 @@ def scan(args):
                      for score, p, info in new])
     con.commit()
 
+    check_crowding(con, jobs, args.notify)
+    if args.notify:  # alert now; the draft follows in about 30 s
+        for score, p, info in new:
+            alert_found(score, p, info, drafting=args.draft)
     if not args.draft:
-        if args.notify:
-            for score, p, info in new:
-                alert(score, p, info, None)
         con.close()
         return
 
@@ -377,7 +487,9 @@ def scan(args):
                 con.commit()
                 print(f"      drafted: {path}")
             if args.notify and (path or p["id"] not in retry_ids):  # retries alert only on success
-                alert(score, p, info, path)
+                if alert_ready(score, p, info, path):
+                    con.execute("UPDATE jobs SET crowd_warned=1 WHERE id=?", (p["id"],))
+                    con.commit()
     con.close()
 
 
