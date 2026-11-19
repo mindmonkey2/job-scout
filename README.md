@@ -85,7 +85,7 @@ A window and tray icon on top of the same database. The scanner keeps running as
 - **Paste a job** window for Upwork and other sites.
 - **Settings** for scan interval, thresholds, crowding limits and skill lists, saved to `config.local.json`, and an option to start in the tray at login.
 - **Scanner controls**: running state and last scan in the status bar, **Stop scanning / Start scanning**, Scan now and the scanner log. The tray icon shows how many fresh matches are waiting.
-- **Shut down** (toolbar, File menu or tray) stops the scanner and closes the app, optionally keeping the scanner from starting at login. Closing the window or Quit leaves the scanner running.
+- **Shut down** (File menu) stops the scanner and closes the app, optionally keeping the scanner from starting at login. Closing the window or Quit leaves the scanner running.
 - Desktop alerts get a **Show in app** button that opens the window on that job.
 
 ### Paste mode (Upwork and other sites)

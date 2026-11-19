@@ -815,11 +815,7 @@ class MainWindow(QMainWindow):
         self.b_pause = QPushButton()
         self.b_pause.setToolTip("Turn the background scanner off or on. Off means no scans and no alerts.")
         self.b_pause.clicked.connect(self.toggle_service)
-        b_shutdown = QPushButton(QIcon.fromTheme("system-shutdown"), "Shut down")
-        b_shutdown.setToolTip("Stop the scanner and close Job Scout completely")
-        b_shutdown.clicked.connect(self.shutdown)
-        top.addWidget(self.b_pause)
-        top.addWidget(b_shutdown)
+        top.addWidget(self.b_pause)  # Shut down lives in the File menu only, so it isn't clicked by accident
 
         self.tabs = QTabBar()
         for name, _ in FILTERS:
@@ -885,7 +881,7 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu("&File")
         for text, key, fn in (("&Paste a job…", "Ctrl+P", self.paste_mode), ("Scan &now", "Ctrl+R", self.scan_now),
                               ("&Settings…", "Ctrl+,", self.settings), ("&Quit (scanner keeps running)", "Ctrl+Q", self.quit),
-                              ("Shut &down (stop scanning and quit)", "Ctrl+Shift+Q", self.shutdown)):
+                              ("Shut &down (stop scanning and quit)…", "", self.shutdown)):
             a = m.addAction(text)
             a.setShortcut(QKeySequence(key))
             a.triggered.connect(fn)
@@ -913,9 +909,7 @@ class MainWindow(QMainWindow):
         self.tray_pause.triggered.connect(self.toggle_service)
         menu.addAction("Paste a job…").triggered.connect(lambda: (self.bring_up(), self.paste_mode()))
         menu.addSeparator()
-        menu.addAction("Close window only (keep scanning)").triggered.connect(self.quit)
-        menu.addAction(QIcon.fromTheme("system-shutdown"), "Shut down (stop scanning and quit)").triggered.connect(
-            self.shutdown)
+        menu.addAction("Quit app (scanner keeps running)").triggered.connect(self.quit)
         self.tray.setContextMenu(menu)
         self._tray_menu = menu
         self.tray.activated.connect(self._tray_click)
